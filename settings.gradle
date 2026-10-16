@@ -1,3 +1,19 @@
+// 构建 JDK 不写死（2026-10-16）：toolchain 需要 JDK 25，缺失时由 foojay resolver 自动下载到
+// Gradle 缓存。插件源优先阿里云镜像（本机实测可达），再回退官方 portal。
+pluginManagement {
+    repositories {
+        maven {
+            name = 'AliyunGradlePlugin'
+            url = 'https://maven.aliyun.com/repository/gradle-plugin'
+        }
+        gradlePluginPortal()
+    }
+}
+
+plugins {
+    // 版本查证自 maven-metadata.xml（2026-10-16，latest=release=0.7.0）
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.7.0'
+}
 // Brush —— 自研 Minecraft 26.1.2 模组加载器（仅客户端）
 // 根工程；模块与源码自 P1.2 起按需加入（见 CLAUDE.md §4）
 rootProject.name = 'Brush'

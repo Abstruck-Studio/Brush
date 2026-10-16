@@ -34,8 +34,8 @@
 //   ③ 即两阶段构建里库模组项目的默认产物位置 ⇒ 建过库模组后 `gradlew build` 自动带上契约 jar。
 //
 // ★ 外部输入（不随导出复制）与对应属性：
-//   vanilla jar          -Pbrush.vanillaJar=<path>        默认 <本项目>/<mcVersion>/<mcVersion>.jar
-//   MC 缓存              -Pbrush.cache=<dir>              默认 <本项目>/cache
+//   vanilla jar          -Pbrush.vanillaJar=<path>        默认 <gradle 用户目录>/caches/brush/<mcVersion>/<mcVersion>.jar
+//   MC 缓存              -Pbrush.cache=<dir>              默认 <gradle 用户目录>/caches/brush/cache
 //   Brush API jar        -PbrushApiJar=<path>             默认按查找顺序 ①属性 ②本项目/libs ③../Brush API/build/libs
 //   NeoForge 安装器 jar  -Pbrush.neoforgeInstaller=<path> 默认无（走 maven.neoforged.net 下载，sha1 校验）
 //                        —— 离线首装用：给了就用本机副本，装不上时不再只能干等超时
@@ -95,12 +95,19 @@ java {
     }
 }
 
-// 本机路径（配置期解析一次）。26.1.2/ 为本地 vanilla 资产（只读）
+// 本机路径（配置期解析一次）。MC 侧默认落在**用户级 Gradle 缓存**（2026-10-16 按用户指示修订）：
+// 与 Fabric Loom / NeoForge neoform 同款做法 —— 项目根不再出现 26.1.2/ 与 cache/ 两个大目录，
+// 多项目共享同一份，省磁盘也省重复下载。想放别处（项目内、共享盘…）照旧传属性覆盖。
+//   vanilla jar → <gradle 用户目录>/caches/brush/<mcVersion>/<mcVersion>.jar
+//   MC 缓存     → <gradle 用户目录>/caches/brush/cache/
 def projectDirPath = project.layout.projectDirectory.asFile.toPath()
+def brushCacheRoot = new File(gradle.gradleUserHomeDir, 'caches/brush')
 def vanillaJar = java.nio.file.Path.of(
-        (project.findProperty('brush.vanillaJar') ?: "$projectDir/${mcVersion}/${mcVersion}.jar") as String)
+        (project.findProperty('brush.vanillaJar')
+                ?: new File(brushCacheRoot, "${mcVersion}/${mcVersion}.jar").absolutePath) as String)
 def cacheDir = java.nio.file.Path.of(
-        (project.findProperty('brush.cache') ?: "$projectDir/cache") as String)
+        (project.findProperty('brush.cache')
+                ?: new File(brushCacheRoot, 'cache').absolutePath) as String)
 // 运行/安装任务的游戏目录（S1 直接用 run/；S2/S3 用 run/<宿主>/）
 def runDir = projectDirPath.resolve('run')
 // 库模组产物（只被**可选的**契约 jar 用到）。查找顺序（2026-10-16 起）：
@@ -590,4 +597,48 @@ tasks.named('assemble') {
 // 保留的宿主安装工具也纳入 check（避免它悄悄腐坏）
 tasks.named('check') {
     dependsOn 'compileToolsJava'
+}
+
+// ===== 发布（maven-publish，2026-10-16 按用户要求新增）=====
+// 默认只发到**本地目录** build/repo（不碰任何远程、不需要凭据）；要发到远程仓库就显式传属性：
+//   -Pbrush.publishUrl=<https://…/repository/…>  [-Pbrush.publishUsername=… -Pbrush.publishPassword=…]
+// 坐标：group = org.abstruck.brush（project.group）/ artifactId = brush / version = gradle.properties 的 loaderVersion
+// 产物：本体 jar（components.java）+ 宿主 harness 工具 jar（classifier = tools）
+// 也可以 `gradlew.bat publishToMavenLocal` 装进本机 ~/.m2 供本地联调。
+apply plugin: 'maven-publish'
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+            artifactId = 'brush'
+            artifact(tasks.named('toolsJar')) {
+                classifier = 'tools'
+            }
+            pom {
+                name = 'Brush'
+                description = 'Brush —— 自研 Minecraft 26.1.2 模组加载器（一个 mod jar 跑三种运行时）'
+                licenses {
+                    license {
+                        name = 'GNU Lesser General Public License v2.1 or later'
+                        url = 'https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html'
+                    }
+                }
+            }
+        }
+    }
+    repositories {
+        maven {
+            name = 'brushLocal'
+            url = project.hasProperty('brush.publishUrl')
+                    ? uri(project.property('brush.publishUrl'))
+                    : layout.buildDirectory.dir('repo')
+            if (project.hasProperty('brush.publishUsername')) {
+                credentials {
+                    username = project.property('brush.publishUsername')
+                    password = project.property('brush.publishPassword')
+                }
+            }
+        }
+    }
 }
