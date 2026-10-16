@@ -1,0 +1,7 @@
+{
+  "id": "brush",
+  "name": "Brush",
+  "version": "${version}",
+  "description": "The Brush mod loader itself",
+  "icon": "assets/brush/textures/gui/icon.png"
+}

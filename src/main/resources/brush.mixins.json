@@ -1,0 +1,24 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "org.abstruck.brush.transform.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "mixins": [
+    "BootstrapMixin",
+    "BuiltInRegistriesMixin",
+    "PackRepositoryMixin",
+    "MinecraftServerMixin",
+    "CrashReportMixin"
+  ],
+  "client": [
+    "MinecraftMixin",
+    "ScreenMixin",
+    "ScreenAccess",
+    "CreativeScreenAccess",
+    "KeyboardAccess",
+    "MouseAccess"
+  ]
+}

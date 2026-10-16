@@ -1,0 +1,593 @@
+// ============================================================================================
+// Brush —— Minecraft 26.1.2 自研模组加载器（**发布版构建脚本**，2026-10-15）
+//
+// 本脚本只做两件事：**产出本体**与**自举运行资产**。测试/开发装置已按用户指示整体移除：
+//   · 移除的**测试性**运行配置：runSelftest(T1) / runFabricSelftest(T2) / runNeoForgeSelftest(T3) /
+//     footprintCheck(T4) / compatTest* / modTest / runRealityProbe* / runExampleClient* /
+//     seed*RealityWorld / generateRealityDriver* / archive*Log
+//     （`runClient` / `runFabricClient` / `runNeoForgeClient` **保留** —— 2026-10-15 按用户指示恢复，
+//       run 是本体最基本的运行方式、不是测试；见下方"基本运行"一节）
+//   · 移除的测试代码与源集：src/test（单测）、src/selftest（自检 + 实机探针 payload）
+//   · 移除的夹具链：compileExampleMod / compileDurabilityHud / compileBlockGuard / compilePingNet、
+//     generateFixtureMod / compileFixtureMod / nestedDepSrc|Jar / selftestFixtureJar /
+//     generateSelftestFixtureMeta / requireExampleMod
+//   （这些装置仍在开发仓 D:\.projects\Brush 里；发布树里不再需要它们。）
+//
+// ★ 新设备从这里开始：**先自举，再编译** ——
+//     gradlew.bat bootstrap        下 version manifest/json → **MC 客户端 jar** → 全部库 + natives → assets
+//                                  （幂等、sha1+size 校验、可续跑；26.1.2 全空目录实测：assets 4750 个 / 457.7 MB +
+//                                   库 59 个 / 65.1 MB + natives 10 个 + 客户端 jar 38.1 MB，整条约 2 分 26 秒）
+//     gradlew.bat installNeoForge  宿主安装产物（含 Brush API 编译所需的 NeoForge universal jar）
+//     gradlew.bat jar              然后才编译（main 源集引用 MC 类型，没有 jar 编译不过）
+//   为什么能先跑：P1 启动器侧（launch/** + BrushProperties）不引用 MC，已拆成独立 `bootstrap` 源集，
+//   下载任务只需要 JDK + gson/log4j。这解掉了"没有 jar ⇒ 编译不过 ⇒ 下不了 jar"的死锁。
+//
+// ★ 产物：
+//     build/libs/Brush-<version>.jar        加载器本体（S1 直接跑；S2/S3 作为 mod 装进宿主）—— `gradlew build` 必产出
+//     build/libs/brush-api-contract.jar     作者编译契约面（仅 org.abstruck.brush.api.**，不含 impl）—— **可选**
+//   → `gradlew build`（含 assemble + check）在**只构建加载器时也能通过**；契约 jar 需要库模组产物，
+//     有则一并产出，无则**明确跳过并打印原因与出路**（2026-10-16 修：此前缺件会让 `build` 直接失败）。
+//
+// ★ 与 Brush API 项目的关系（另一个独立项目，见 ../Brush API）：
+//   本项目**不依赖**它即可编译与出包（契约 jar 是唯一用到它的地方）。库模组产物的查找顺序：
+//     ① -PbrushApiJar=<path>   ② <本项目>/libs/brush-api.jar   ③ ../Brush API/build/libs/brush-api.jar
+//   ③ 即两阶段构建里库模组项目的默认产物位置 ⇒ 建过库模组后 `gradlew build` 自动带上契约 jar。
+//
+// ★ 外部输入（不随导出复制）与对应属性：
+//   vanilla jar          -Pbrush.vanillaJar=<path>        默认 <本项目>/<mcVersion>/<mcVersion>.jar
+//   MC 缓存              -Pbrush.cache=<dir>              默认 <本项目>/cache
+//   Brush API jar        -PbrushApiJar=<path>             默认按查找顺序 ①属性 ②本项目/libs ③../Brush API/build/libs
+//   NeoForge 安装器 jar  -Pbrush.neoforgeInstaller=<path> 默认无（走 maven.neoforged.net 下载，sha1 校验）
+//                        —— 离线首装用：给了就用本机副本，装不上时不再只能干等超时
+// ============================================================================================
+
+// Brush —— 自研 Minecraft 26.1.2 模组加载器（仅客户端，CLAUDE.md §1）
+// P1 加载与启动管线：直接加载本地 vanilla jar —— 26.1 起未混淆，官方名即运行时名（无重映射）。
+// P2 注入层：sponge-mixin（Fabric fork，Mixin 0.8.7 内核）+ MixinExtras + 自实现 IMixinService。
+plugins {
+    id 'java'
+}
+
+group = 'org.abstruck.brush'
+// 版本单一来源：gradle.properties 的 loaderVersion
+version = project.findProperty('loaderVersion') ?: '26.10.1'
+// 目标 MC 版本单一来源：gradle.properties 的 mcVersion（任务参数 / vanillaJar 路径共用）
+def mcVersion = project.findProperty('mcVersion') ?: '26.1.2'
+
+repositories {
+    // repo1.maven.org 本机经代理访问存在持续性 404（2026-10-08 实测），
+    // 以可用的阿里云公共镜像优先；mavenCentral 单列保留为原始来源。
+    maven {
+        name = 'AliyunPublic'
+        url = 'https://maven.aliyun.com/repository/public'
+    }
+    mavenCentral()
+    // sponge-mixin 的官方发布源（只承载 net.fabricmc:*）
+    maven {
+        name = 'FabricMC'
+        url = 'https://maven.fabricmc.net/'
+        content {
+            includeGroup 'net.fabricmc'
+        }
+    }
+    // NeoForge 官方 maven（只承载 net.neoforged*；正则而非 includeGroup，见开发仓的事故记录）
+    maven {
+        name = 'NeoForged'
+        url = 'https://maven.neoforged.net/releases'
+        content {
+            includeGroupByRegex 'net\\.neoforged.*'
+        }
+    }
+    // Mojang 官方库（vanilla version json 的 libraries 权威源：DFU / brigadier）
+    maven {
+        name = 'MojangLibraries'
+        url = 'https://libraries.minecraft.net/'
+        content {
+            includeGroup 'com.mojang'
+        }
+    }
+}
+
+java {
+    toolchain {
+        // MC 26.1+ 强制 Java 25（version json javaVersion.majorVersion=25 实测）
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+// 本机路径（配置期解析一次）。26.1.2/ 为本地 vanilla 资产（只读）
+def projectDirPath = project.layout.projectDirectory.asFile.toPath()
+def vanillaJar = java.nio.file.Path.of(
+        (project.findProperty('brush.vanillaJar') ?: "$projectDir/${mcVersion}/${mcVersion}.jar") as String)
+def cacheDir = java.nio.file.Path.of(
+        (project.findProperty('brush.cache') ?: "$projectDir/cache") as String)
+// 运行/安装任务的游戏目录（S1 直接用 run/；S2/S3 用 run/<宿主>/）
+def runDir = projectDirPath.resolve('run')
+// 库模组产物（只被**可选的**契约 jar 用到）。查找顺序（2026-10-16 起）：
+//   ① -PbrushApiJar=<path>   ② <本项目>/libs/brush-api.jar   ③ **兄弟项目 ../Brush API/build/libs/brush-api.jar**
+// ③ 就是两阶段构建里 Brush API 项目的默认产物位置 ⇒ 建过库模组后，本项目的 `gradlew build`
+// 会自动把契约 jar 一起产出，无需手工拷贝或传属性。
+def brushApiJarCandidates = []
+if (project.hasProperty('brushApiJar')) {
+    brushApiJarCandidates << (project.property('brushApiJar') as String)
+}
+brushApiJarCandidates << "$projectDir/libs/brush-api.jar"
+brushApiJarCandidates << "$projectDir/../Brush API/build/libs/brush-api.jar"
+def brushApiJar = files(brushApiJarCandidates.find { new File(it).isFile() } ?: brushApiJarCandidates[0])
+
+dependencies {
+    // JSON 解析。来源：Central com.google.code.gson:gson:2.10.1  许可：Apache-2.0
+    implementation 'com.google.code.gson:gson:2.10.1'
+
+    // 字节码处理：Mixin 运行时依赖。来源：Central org.ow2.asm:*:9.10.1  许可：BSD-3-Clause
+    implementation 'org.ow2.asm:asm:9.10.1'
+    implementation 'org.ow2.asm:asm-commons:9.10.1'
+    implementation 'org.ow2.asm:asm-tree:9.10.1'
+    implementation 'org.ow2.asm:asm-analysis:9.10.1'
+    implementation 'org.ow2.asm:asm-util:9.10.1'
+
+    // Mixin：Fabric fork（Mixin 0.8.7 内核 + Fabric 补丁）
+    // 来源：https://maven.fabricmc.net/net/fabricmc/sponge-mixin/0.17.4+mixin.0.8.7/  许可：MIT
+    implementation 'net.fabricmc:sponge-mixin:0.17.4+mixin.0.8.7'
+    // MixinExtras：可链式注入器（@WrapOperation / @WrapMethod 等）
+    // 来源：Central io.github.llamalad7:mixinextras-common:0.5.5  许可：MIT
+    implementation 'io.github.llamalad7:mixinextras-common:0.5.5'
+
+    // 日志（app 侧独立 log4j context；游戏侧用 MC 自带那份）
+    // 来源：Central org.apache.logging.log4j:log4j-api|core:2.22.1  许可：Apache-2.0
+    implementation 'org.apache.logging.log4j:log4j-api:2.22.1'
+    implementation 'org.apache.logging.log4j:log4j-core:2.22.1'
+
+    // ===== 编译期依赖（compileOnly：不进运行时 classpath、不进产物 jar）=====
+    // vanilla jar（编译 MC 类型）
+    compileOnly files(vanillaJar.toFile())
+    // DFU：编译 net.minecraft.core.Registry 时其父接口链需要 Keyable
+    // 来源：https://libraries.minecraft.net/com/mojang/datafixerupper/9.0.19/  许可：MIT
+    compileOnly 'com.mojang:datafixerupper:9.0.19'
+    // Brigadier：Component 的类型链经 com.mojang.brigadier.Message
+    // 来源：https://libraries.minecraft.net/com/mojang/brigadier/1.3.10/  许可：MIT
+    compileOnly 'com.mojang:brigadier:1.3.10'
+    // Fabric Loader（S2 宿主适配的编译期 API：ClientModInitializer / FabricLoader）
+    // 来源：https://maven.fabricmc.net/net/fabricmc/fabric-loader/0.19.5/  许可：Apache-2.0（POM 为 shell pom，故取 @jar）
+    compileOnly 'net.fabricmc:fabric-loader:0.19.5@jar'
+    // NeoForge 编译期 API：FML / 事件总线 / Dist（S3 宿主适配）
+    // 来源与许可（各条自述）：fancymodloader loader 11.0.15、bus 8.0.5、mergetool 2.0.7 —— LGPL v2.1
+    compileOnly 'net.neoforged.fancymodloader:loader:11.0.15@jar'
+    compileOnly 'net.neoforged:bus:8.0.5@jar'
+    compileOnly 'net.neoforged:mergetool:2.0.7:api@jar'
+    // IModInfo.getVersion() 的返回类型（仅编译期；宿主运行时自带）
+    // 来源：Central org.apache.maven:maven-artifact:3.9.9  许可：Apache-2.0
+    compileOnly 'org.apache.maven:maven-artifact:3.9.9@jar'
+    // netty：FriendlyByteBuf 的父类型 ByteBuf（MC 库提供运行时那份）
+    // 来源：Central io.netty:netty-buffer:4.2.7.Final  许可：Apache-2.0
+    compileOnly 'io.netty:netty-buffer:4.2.7.Final'
+}
+
+// 源码与资源统一 UTF-8
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs << '-Xlint:deprecation'
+}
+
+// 编译 main 前先检查 vanilla jar 是否就位（2026-10-15）：缺件时若不拦，报出来的是成片
+// "找不到符号: Identifier / ItemStack …"，让人误以为代码坏了（本导出实测踩到）。
+// 用**独立任务**（无声明输出 ⇒ 每次都执行；挂在 compileJava 上是 doFirst 会被 up-to-date 跳过）。
+tasks.register('verifyVanillaJar') {
+    group = 'brush'
+    description = 'Fail readably when the vanilla jar is missing (needed to compile main; run bootstrap to fetch it)'
+    doLast {
+        if (!vanillaJar.toFile().isFile()) {
+            throw new GradleException('vanilla jar not found: ' + vanillaJar
+                    + ' -- run `gradlew.bat bootstrap` first (it downloads the MC client jar),'
+                    + ' or pass -Pbrush.vanillaJar=<path to ' + mcVersion + '.jar>')
+        }
+    }
+}
+tasks.named('compileJava') {
+    dependsOn 'verifyVanillaJar'
+}
+
+// ===== P1 启动器侧独立源集：**不引用任何 MC 类型**，让自举只需要 JDK =====
+// 只有 launch/** 与 BrushProperties 参与（实证：它们不引用 net.minecraft，跨包引用也只是
+// launch.* 内部 + 对游戏侧类的 Class.forName 字符串）。
+// 若无此拆分，编译 main 需要 vanilla jar ⇒"没有 jar 就编译不过、也就下不了 jar"死锁。
+sourceSets {
+    bootstrap {
+        java {
+            srcDirs = ['src/main/java']
+            include 'org/abstruck/brush/launch/**'
+            include 'org/abstruck/brush/BrushProperties.java'
+        }
+        resources.srcDirs = []
+    }
+}
+configurations {
+    bootstrapImplementation.extendsFrom implementation
+    bootstrapRuntimeOnly.extendsFrom runtimeOnly
+}
+
+// ===== 宿主 harness / profile 源集 =====
+// 保留 **4 个类**：`FabricHostHarness` / `FabricHostProfile`（供 `runFabricClient` 装配并拉起 Fabric 宿主）、
+// `NeoForgeHostHarness` / `NeoForgeHostProfile`（供 `installNeoForge` 与 `runNeoForgeClient`）。
+// 复用 main 的启动管线类（VersionInfo / DependencyAssembler / Downloader / LaunchParams）。
+// 它们不引用 MC 类型，故不需要 MC 编译期依赖。
+sourceSets {
+    tools {
+        java.srcDir 'src/tools/java'
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+configurations {
+    toolsImplementation.extendsFrom implementation
+    toolsRuntimeOnly.extendsFrom runtimeOnly
+}
+
+// ===== 核心资源包索引（S1 standalone 需要把 Brush 自身 assets/** 挂进资源栈）=====
+// 类路径条目无法在运行期枚举，故构建期扫描 src/main/resources/{assets,data} 生成
+// brush-resources.index（每行一条相对路径），经 processResources 打进输出根。
+def brushResourceIndexDir = layout.buildDirectory.dir('generated/brush-index')
+
+tasks.register('generateBrushResourceIndex') {
+    def resourcesRoot = layout.projectDirectory.dir('src/main/resources').asFile
+    def indexDir = brushResourceIndexDir
+    group = 'brush'
+    description = 'Generate brush-resources.index: newline-separated list of assets/ and data/ files under src/main/resources (used by the S1 standalone core resource pack)'
+    inputs.dir(resourcesRoot).withPropertyName('sourceResources')
+    outputs.dir(indexDir).withPropertyName('indexDir')
+    doLast {
+        def lines = []
+        ['assets', 'data'].each { top ->
+            def dir = new File(resourcesRoot, top)
+            if (dir.isDirectory()) {
+                dir.eachFileRecurse { file ->
+                    if (file.isFile()) {
+                        lines << resourcesRoot.toPath().relativize(file.toPath()).toString()
+                                .replace('\\', '/')
+                    }
+                }
+            }
+        }
+        lines.sort()
+        def outFile = new File(indexDir.get().asFile, 'brush-resources.index')
+        outFile.parentFile.mkdirs()
+        outFile.setText(lines.join('\n') + (lines.isEmpty() ? '' : '\n'), 'UTF-8')
+        println "[brush] brush-resources.index written: ${lines.size()} file(s)"
+    }
+}
+
+// brush.mod.json / fabric.mod.json / neoforge.mods.toml / brush-build.properties 的 ${version} 构建期展开
+// （单一来源 = 本文件顶部的 version / mcVersion）。
+tasks.named('processResources') {
+    // 在配置期捕获版本串；execution-time 闭包内不得再访问 Task.project（Gradle 10 将报错）
+    def expandedVersion = project.version.toString()
+    def expandedMc = mcVersion.toString()
+    def expandedLoader = (project.findProperty('loaderVersion') ?: '26.10.1').toString()
+    filesMatching(['brush.mod.json', 'fabric.mod.json', 'META-INF/neoforge.mods.toml',
+                   'brush-build.properties']) {
+        expand(version: expandedVersion, mcVersion: expandedMc, loaderVersion: expandedLoader)
+    }
+    dependsOn 'generateBrushResourceIndex'
+    from(brushResourceIndexDir)
+}
+
+// ===== P1.2/P1.3/P1.5.0/自举（**发布后使用者与 CI 真正要用的入口**）=====
+// 三者都幂等：已就位且 sha1/size 匹配即跳过；assets 内容寻址可断点续跑。
+// 用 bootstrap 源集 ⇒ 只需要 JDK + gson/log4j，**不需要先有 vanilla jar**。
+tasks.register('metadata', JavaExec) {
+    group = 'brush'
+    description = 'Fetch Minecraft version metadata (manifest -> version json); downloads the client jar when missing, otherwise cross-checks it (sha1 + size)'
+    classpath = sourceSets.bootstrap.runtimeClasspath
+    mainClass = 'org.abstruck.brush.launch.meta.MetadataMain'
+    args = [
+            '--version=' + mcVersion,
+            '--cache=' + cacheDir,
+            '--client-jar=' + vanillaJar,
+    ]
+}
+
+tasks.register('libraries', JavaExec) {
+    group = 'brush'
+    description = 'Download all applicable Minecraft libraries (incl. natives) and extract natives into cache/natives'
+    dependsOn 'metadata'
+    classpath = sourceSets.bootstrap.runtimeClasspath
+    mainClass = 'org.abstruck.brush.launch.deps.LibrariesMain'
+    args = [
+            '--version=' + mcVersion,
+            '--cache=' + cacheDir,
+    ]
+}
+
+tasks.register('assets', JavaExec) {
+    group = 'brush'
+    description = 'Download the Minecraft asset index and all objects into cache/assets (sha1 verified, resumable)'
+    dependsOn 'metadata'
+    classpath = sourceSets.bootstrap.runtimeClasspath
+    mainClass = 'org.abstruck.brush.launch.assets.AssetsMain'
+    args = [
+            '--version=' + mcVersion,
+            '--cache=' + cacheDir,
+    ]
+}
+
+tasks.register('bootstrap') {
+    group = 'brush'
+    description = 'Fresh-device bootstrap: download the MC client jar + libraries/natives + assets (idempotent, sha1 verified)'
+    dependsOn 'metadata'
+    dependsOn 'libraries'
+    dependsOn 'assets'
+}
+
+// ===== 宿主安装（只装不启动）=====
+// 跑 S2/S3 或编译 ../Brush API 时需要 NeoForge 安装产物（含 universal jar）。
+// 官方安装器经 sha1 核验后运行；装完即退出，不启动游戏。
+tasks.register('installNeoForge', JavaExec) {
+    group = 'brush'
+    description = 'Install the NeoForge host artifacts into the cache (official installer, sha1-verified; no game launch)'
+    dependsOn 'metadata'
+    classpath = sourceSets.tools.runtimeClasspath
+    mainClass = 'org.abstruck.brush.tools.NeoForgeHostHarness'
+    jvmArgs = ['-Xmx2G']
+    workingDir = runDir.toFile()
+    doFirst {
+        workingDir.mkdirs()
+    }
+    args = [
+            '--version=' + mcVersion,
+            '--cache=' + cacheDir,
+            '--client-jar=' + vanillaJar,
+            '--instance=' + runDir.resolve('neoforge'),
+            '--install-only',
+    ] + (project.hasProperty('brush.neoforgeInstaller')
+            ? ['--installer-jar=' + project.property('brush.neoforgeInstaller')] : [])
+}
+
+// ===== 基本运行（2026-10-15 按用户指示恢复：run 是本体最基本的运行方式，不是测试）=====
+// 三个都是**纯客户端启动**（交互式，不带自检 / 探针 / 夹具）：
+//   runClient          S1：纯 Brush（vanilla + 我们的 ClassLoader + 注入层）
+//   runFabricClient    S2：Fabric 宿主（Knot + Fabric Loader；宿主 mod 由 harness 装到 cache/fabric）
+//   runNeoForgeClient  S3：NeoForge 宿主（FML；宿主产物用 `gradlew installNeoForge` 备好）
+// 三者都依赖 libraries + assets（幂等 ⇒ 首次运行会自动补齐 MC 库与资产）。
+// 注：需要夹具 mod 的验收变体（runExampleClient*）与自检/探针变体（runSelftest*/runRealityProbe*）
+//     属开发/验证装置，发布树不包含。
+def registerBrushRun = { String taskName, String taskDescription, List<String> extraArgs ->
+    tasks.register(taskName, JavaExec) {
+        group = 'brush'
+        description = taskDescription
+        dependsOn 'libraries'
+        dependsOn 'assets'
+        classpath = sourceSets.main.runtimeClasspath
+        mainClass = 'org.abstruck.brush.launch.Brush'
+        jvmArgs = ['-Xmx2G', '--sun-misc-unsafe-memory-access=allow', '--enable-native-access=ALL-UNNAMED']
+        workingDir = runDir.toFile()
+        doFirst {
+            workingDir.mkdirs()
+            // 注入栈顺序敏感：我们自己的条目必须排在最前（sponge-mixin 的 ServiceLoader 扫描按
+            // classpath 顺序取第一个 isValid 的服务；sponge jar 若先被枚举会实例化
+            // MixinServiceLaunchWrapper 并因缺 net.minecraft.launchwrapper 而当场失败 —— 2026-10-08 实测）。
+            def injectLibs = []
+            sourceSets.main.output.classesDirs.each { injectLibs.add(it) }
+            injectLibs.add(sourceSets.main.output.resourcesDir)
+            configurations.runtimeClasspath.resolve().findAll { file ->
+                def name = file.name
+                name.startsWith('sponge-mixin-') || name.startsWith('mixinextras-common-') || name.startsWith('asm-')
+            }.each { injectLibs.add(it) }
+            args += '--inject-libs=' + injectLibs.join(File.pathSeparator)
+        }
+        args = [
+                '--version=' + mcVersion,
+                '--cache=' + cacheDir,
+                '--game-dir=' + runDir,
+                '--client-jar=' + vanillaJar,
+        ] + extraArgs
+    }
+}
+
+registerBrushRun('runClient',
+        'S1: launch the local Minecraft 26.1.2 client through the Brush ClassLoader (vanilla + Brush)', [])
+
+// ===== 可选：把指定的 mod 摆进本次运行要用的 brush-mods/ =====
+// 2026-10-16（用户：Brush API 与 MDK 都要能带自己的 mod 跑起来测试）——
+// `-Pbrush.runMods=<file-or-dir>[;<...>]`（分隔符 = 平台 pathSeparator）：给 jar 就复制该 jar，
+// 给目录就复制目录下所有 *.jar。**不传该属性 = 行为与此前完全一致**（清空后干净启动）。
+// 注意执行顺序：必须在"清空 brush-mods"之后调用，否则刚复制的 jar 会被清掉。
+def stageRunMods = { java.io.File modsDir ->
+    modsDir.mkdirs()
+    if (!project.hasProperty('brush.runMods')) {
+        return
+    }
+    def staged = []
+    (project.property('brush.runMods') as String).split(java.io.File.pathSeparator).each { raw ->
+        if (raw == null || raw.trim().isEmpty()) {
+            return
+        }
+        def path = project.file(raw.trim())
+        if (path.isDirectory()) {
+            path.listFiles()?.findAll { it.isFile() && it.name.endsWith('.jar') }?.sort { it.name }?.each { src ->
+                project.copy { from src; into modsDir }
+                staged << src.name
+            }
+        } else if (path.isFile()) {
+            project.copy { from path; into modsDir }
+            staged << path.name
+        } else {
+            throw new GradleException('brush.runMods entry not found: ' + path +
+                    ' -- pass a jar file or a directory containing the mod jars to load')
+        }
+    }
+    println '[brush] run mods staged into ' + modsDir + ': ' +
+            (staged.isEmpty() ? '(directory had no .jar)' : staged.join(', '))
+}
+
+// 纯客户端启动默认不装载任何我们的 mod（清掉历史残留，保证"干净 S1"是确定态）；
+// 传了 -Pbrush.runMods= 时在清空之后把指定 mod 摆进来。
+tasks.named('runClient') {
+    doFirst {
+        def dir = runDir.resolve('brush-mods').toFile()
+        dir.listFiles()?.each { f -> if (f.name.endsWith('.jar')) { f.delete() } }
+        stageRunMods(dir)
+    }
+}
+
+def registerFabricRun = { String taskName, String taskDescription, List<String> extraHarnessArgs ->
+    tasks.register(taskName, JavaExec) {
+        group = 'brush'
+        description = taskDescription
+        dependsOn 'jar'             // build/libs/brush-<version>.jar 进 run/fabric/mods/
+        dependsOn 'libraries'       // MC 库与 natives 就绪（幂等，命中缓存）
+        dependsOn 'assets'
+        classpath = sourceSets.tools.runtimeClasspath
+        mainClass = 'org.abstruck.brush.tools.FabricHostHarness'
+        jvmArgs = ['-Xmx2G']
+        workingDir = runDir.toFile()
+        doFirst {
+            workingDir.mkdirs()
+            // 2026-10-15（用户报"长时间卡在 MC libraries 之后"）：把**本地已解析**的注入栈 jar 交给 harness。
+            // 起因：harness 会为 FabricHostProfile.LIBS（asm×5 + sponge-mixin + fabric-loader）联网下载，
+            // 而这些正是本项目自己的编译/运行依赖 —— 本机 Gradle 缓存里就有，不该再下（maven.fabricmc.net
+            // 不通时旧实现会静默等满 3×2 分钟）。给出去之后 harness 直接复制，缺件才退化为下载。
+            def localLibs = (configurations.runtimeClasspath.resolve()
+                    + configurations.compileClasspath.resolve()).findAll { file ->
+                def name = file.name
+                name.startsWith('asm-') || name.startsWith('sponge-mixin-')
+                        || name.startsWith('mixinextras-') || name.startsWith('fabric-loader-')
+            }.collect { it.absolutePath }
+            args = [
+                    '--version=' + mcVersion,
+                    '--cache=' + cacheDir,
+                    '--client-jar=' + vanillaJar,
+                    '--instance=' + runDir.resolve('fabric'),
+                    '--brush-jar=' + tasks.jar.archiveFile.get().asFile.absolutePath,
+                    '--inject-libs=' + localLibs.join(File.pathSeparator),
+            ] + extraHarnessArgs
+        }
+    }
+}
+
+registerFabricRun('runFabricClient',
+        'S2: launch Fabric-hosted MC (Knot + Fabric Loader) with Brush installed as a host mod', [])
+
+// 纯客户端启动默认不装载我们的 mod（同 runClient）；传了 -Pbrush.runMods= 时装载指定 mod
+tasks.named('runFabricClient') {
+    doFirst {
+        def dir = runDir.resolve('fabric').resolve('brush-mods').toFile()
+        dir.listFiles()?.each { f -> if (f.name.endsWith('.jar')) { f.delete() } }
+        stageRunMods(dir)
+    }
+}
+
+def registerNeoForgeRun = { String taskName, String taskDescription, List<String> extraHarnessArgs ->
+    tasks.register(taskName, JavaExec) {
+        group = 'brush'
+        description = taskDescription
+        dependsOn 'jar'             // build/libs/brush-<version>.jar 进 run/neoforge/mods/
+        dependsOn 'libraries'       // MC 库与 natives 就绪（幂等，命中缓存）
+        dependsOn 'assets'
+        classpath = sourceSets.tools.runtimeClasspath
+        mainClass = 'org.abstruck.brush.tools.NeoForgeHostHarness'
+        jvmArgs = ['-Xmx2G']
+        workingDir = runDir.toFile()
+        doFirst {
+            workingDir.mkdirs()
+            args = [
+                    '--version=' + mcVersion,
+                    '--cache=' + cacheDir,
+                    '--client-jar=' + vanillaJar,
+                    '--instance=' + runDir.resolve('neoforge'),
+                    '--brush-jar=' + tasks.jar.archiveFile.get().asFile.absolutePath,
+            ] + (project.hasProperty('brush.neoforgeInstaller')
+                    ? ['--installer-jar=' + project.property('brush.neoforgeInstaller')] : []) + extraHarnessArgs
+        }
+    }
+}
+
+registerNeoForgeRun('runNeoForgeClient',
+        'S3: launch NeoForge-hosted MC (FML) with Brush installed as a host mod', [])
+
+// 纯客户端启动默认不装载我们的 mod（同 runClient）；传了 -Pbrush.runMods= 时装载指定 mod
+tasks.named('runNeoForgeClient') {
+    doFirst {
+        def dir = runDir.resolve('neoforge').resolve('brush-mods').toFile()
+        dir.listFiles()?.each { f -> if (f.name.endsWith('.jar')) { f.delete() } }
+        stageRunMods(dir)
+    }
+}
+
+// ===== 作者编译契约 jar（可选发布物）=====
+// 目的：给 mod 作者一个**小而稳定**的编译期依赖面 —— 只含 org.abstruck.brush.api.**，不含 impl
+// （不含 L1 transform/、不含加载器内部 mod/ launch/ host/ ui/）。
+// 其中一部分 api 类住在库模组（网络引擎）。**缺库模组产物时明确跳过并说明**（不是静默、也不再让
+// `gradlew build` 失败）：本体 jar 完全不依赖契约 jar —— 2026-10-16 用户报 `gradlew build` 在
+// 只构建加载器时报 "Brush API jar not found"，根因就是这条把**另一个项目的产物**设成了必需依赖。
+tasks.register('apiContractJar', Jar) {
+    group = 'brush'
+    description = 'Package the mod-author compile contract (only org.abstruck.brush.api.**, excluding impl; skipped when the Brush API jar is absent)'
+    dependsOn 'classes'
+    archiveFileName = 'brush-api-contract.jar'
+    destinationDirectory.set(layout.buildDirectory.dir('libs'))
+    from(sourceSets.main.output) {
+        include 'org/abstruck/brush/api/**'
+    }
+    from({ zipTree(brushApiJar.singleFile) }) {
+        include 'org/abstruck/brush/api/**'
+        exclude 'org/abstruck/brush/api/impl/**'
+    }
+    // onlyIf 而非 doFirst 抛错：缺件时按"可选产物"语义跳过，并把原因与两条出路打到控制台。
+    // 写法注意（本仓踩过三次的 Groovy 坑）：续行**不得以 `+` 开头**（会被解析成一元正号 →
+    // No signature of method: java.lang.String.positive()），故把 `+` 放在行尾。
+    onlyIf {
+        def jar = brushApiJar.singleFile
+        boolean present = jar.isFile()
+        if (!present) {
+            println "[brush] apiContractJar SKIPPED -- Brush API jar not found at ${jar} ; " +
+                    "the loader jar does not need it. To also produce the contract jar: build the " +
+                    "Brush API project (cd \"../Brush API\" && gradlew.bat jar " +
+                    "-PbrushCoreJar=<this project>/build/libs/Brush-<version>.jar), or pass " +
+                    "-PbrushApiJar=<path to brush-api.jar>."
+        }
+        present
+    }
+    doLast {
+        // 机械校验：产物里**只能**有 api 包下的条目，且**不得含 impl 实现**
+        def jar = archiveFile.get().asFile
+        def zip = new java.util.zip.ZipFile(jar)
+        try {
+            def bad = java.util.Collections.list(zip.entries()).findAll { e ->
+                !e.directory && e.name != 'META-INF/MANIFEST.MF'
+                        && (!e.name.startsWith('org/abstruck/brush/api/')
+                            || e.name.startsWith('org/abstruck/brush/api/impl/'))
+            }
+            if (!bad.isEmpty()) {
+                throw new GradleException("apiContractJar must contain only"
+                        + " org/abstruck/brush/api/** (no impl) but found: ${bad.take(5)*.name}")
+            }
+            println "[brush] api contract jar: ${jar.name} (${zip.size()} entries, api package only)"
+        } finally {
+            zip.close()
+        }
+    }
+}
+
+// ===== 宿主 harness 工具 jar（2026-10-16 按用户指示新增）=====
+// 为什么单独发一个 jar：Fabric / NeoForge 的宿主装配逻辑（FabricHostHarness / NeoForgeHostHarness
+// 及其 profile）住在 src/tools，**不在加载器本体 jar 里**。MDK 与 Brush API 项目要做到"整个文件夹
+// 拷到别的设备也能跑 S2/S3"，就得把这份工具一起带上。它只依赖加载器的 launch/**（在本体 jar 内）
+// 与 gson/log4j，不引用 MC 类型，也不含任何第三方二进制。
+tasks.register('toolsJar', Jar) {
+    group = 'brush'
+    description = 'Package the host harnesses (Fabric / NeoForge) so a jar-only MDK can run S2/S3'
+    dependsOn 'toolsClasses'
+    archiveFileName = 'brush-tools.jar'
+    destinationDirectory.set(layout.buildDirectory.dir('libs'))
+    from(sourceSets.tools.output)
+}
+
+tasks.named('assemble') {
+    dependsOn 'apiContractJar'
+    dependsOn 'toolsJar'
+}
+
+// 保留的宿主安装工具也纳入 check（避免它悄悄腐坏）
+tasks.named('check') {
+    dependsOn 'compileToolsJava'
+}

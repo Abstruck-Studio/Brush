@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "brush",
+  "version": "${version}",
+  "name": "Brush",
+  "description": "Brush loader as a Fabric host adaptation (S2): thin injection + runtime dispatch, loads brush-mods/ alongside Fabric mods.",
+  "icon": "assets/brush/textures/gui/icon.png",
+  "license": "LGPL-2.1-or-later",
+  "environment": "client",
+  "entrypoints": {
+    "preLaunch": [
+      "org.abstruck.brush.host.fabric.BrushFabricPreLaunch"
+    ],
+    "client": [
+      "org.abstruck.brush.host.fabric.BrushFabricClient"
+    ]
+  },
+  "mixins": [
+    "brush.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~26.1.2",
+    "java": ">=25"
+  }
+}
