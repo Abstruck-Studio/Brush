@@ -182,6 +182,11 @@ tasks.withType(JavaCompile).configureEach {
 tasks.register('verifyVanillaJar') {
     group = 'brush'
     description = 'Fail readably when the vanilla jar is missing (needed to compile main; run bootstrap to fetch it)'
+    // 2026-10-16（用户要求"构建时自动自举，不要我手动跑 bootstrap"）：编译前自动补齐 MC 客户端 jar。
+    // 离线 / CI 想完全自己掌控就传 -Pbrush.autoBootstrap=false —— 那时缺件仍然可读失败。
+    if (!project.hasProperty('brush.autoBootstrap') || project.property('brush.autoBootstrap') != 'false') {
+        dependsOn 'metadata'
+    }
     doLast {
         if (!vanillaJar.toFile().isFile()) {
             throw new GradleException('vanilla jar not found: ' + vanillaJar
